@@ -33,6 +33,8 @@ DIR_SOURCE = str(Path(__file__).resolve().parent.parent)  # 代码根目录写�
 sys.path.append(DIR_SOURCE)
 from ENV import DIR_LOG, tag_dm_map, model_lit_map
 from utils.util import MyProgressBar, fix_seed, format_time, cal_binary_metrics, masks_to_indexs
+from utils.losses import FocalLoss
+from utils.rare_pattern import make_rare_pattern_weights
 from nn.litnn import LitGNN
 
 torch.set_float32_matmul_precision('medium')
@@ -363,13 +365,63 @@ class LitSAGE(LitGNN):
         self.model = SAGE(d_in, n_classes, **kwargs)
         self.his_emb = self.model.his_emb
 
+        self.loss_mode = kwargs.get('loss_mode', 'baseline')
+        self.focal_gamma = kwargs.get('focal_gamma', 2.0)
+        self.focal_alpha = kwargs.get('focal_alpha', [1.0, 3.0])
+        self.rare_num_bins = kwargs.get('rare_num_bins', 5)
+        self.rare_top_k_features = kwargs.get('rare_top_k_features', 10)
+        self.rare_max_weight = kwargs.get('rare_max_weight', 3.0)
+        self.rare_fraud_boost = kwargs.get('rare_fraud_boost', 1.5)
+
+        if self.loss_mode in ('focal', 'both'):
+            self.focal_loss = FocalLoss(gamma=self.focal_gamma, alpha=self.focal_alpha, reduction='mean')
+        else:
+            self.focal_loss = None
+
+        self.rare_weights = None
+
     def on_train_epoch_start(self) -> None:
         self.model.his_emb.copy_(self.his_emb)
+
+    def on_fit_start(self):
+        self.trn_idx, self.val_idx, self.tst_idx = masks_to_indexs(self.trainer.datamodule.g)
+        if self.init_bin_width and self.use_dyple:
+            self.model.embedding0.dy_ple_layer.init_params(
+                self.trainer.datamodule.g.ndata['feature'][self.trn_idx],
+                self.trainer.datamodule.g.ndata['label'][self.trn_idx])
+
+        if self.loss_mode in ('rare', 'both'):
+            g = self.trainer.datamodule.g
+            self.rare_weights = make_rare_pattern_weights(
+                features=g.ndata['feature'],
+                labels=g.ndata['label'],
+                train_mask=g.ndata['train_mask'],
+                num_bins=self.rare_num_bins,
+                top_k_features=self.rare_top_k_features,
+                max_weight=self.rare_max_weight,
+                fraud_boost=self.rare_fraud_boost,
+            )
 
     def training_step(self, batch, batch_idx):
         blocks, x, y, mask = self.unify_batch(batch, 'train_mask')
         logit, _ = self(blocks, x)
-        loss = F.cross_entropy(logit[mask], y[mask])
+
+        if self.loss_mode == 'baseline':
+            loss = F.cross_entropy(logit[mask], y[mask])
+        elif self.loss_mode == 'focal':
+            loss = self.focal_loss(logit[mask], y[mask])
+        elif self.loss_mode == 'rare':
+            nid = blocks[-1].dstdata[dgl.NID]
+            sample_weights = self.rare_weights[nid].to(logit.device)
+            loss_each = F.cross_entropy(logit[mask], y[mask], reduction='none')
+            loss = (loss_each * sample_weights).mean()
+        elif self.loss_mode == 'both':
+            nid = blocks[-1].dstdata[dgl.NID]
+            sample_weights = self.rare_weights[nid].to(logit.device)
+            loss = self.focal_loss(logit[mask], y[mask], sample_weight=sample_weights)
+        else:
+            loss = F.cross_entropy(logit[mask], y[mask])
+
         self.log('trloss', loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=len(y[mask]))
         lr = self.trainer.optimizers[0].param_groups[0]['lr']
         self.log('lr', lr, on_epoch=True)
@@ -395,13 +447,20 @@ class LitSAGE(LitGNN):
             logit = logit[torch.argsort(nid)]
             self.his_emb = his_emb[torch.argsort(nid)]
             # self.model.his_emb.copy_(his_emb)
-            y = y.cpu().numpy()
+            y_np = y.cpu().numpy()
             prob = logit.softmax(-1).cpu().numpy()[:, 1]
-            out_dic = cal_binary_metrics(y, prob, self.trn_idx, self.val_idx, self.tst_idx)
+            out_dic = cal_binary_metrics(y_np, prob, self.trn_idx, self.val_idx, self.tst_idx)
             self.log("val_auc", out_dic['val_auc'], prog_bar=True, on_step=False, on_epoch=True)
             self.log("val_aps", out_dic['val_aps'], prog_bar=True, on_step=False, on_epoch=True)
             self.log("tst_auc", out_dic['tst_auc'], prog_bar=True, on_step=False, on_epoch=True)
             self.log("tst_aps", out_dic['tst_aps'], prog_bar=True, on_step=False, on_epoch=True)
+
+            self.log("val_mf1", out_dic['val_mf1'], on_step=False, on_epoch=True)
+            self.log("val_rec", out_dic['val_rec'], on_step=False, on_epoch=True)
+            self.log("val_pre", out_dic['val_pre'], on_step=False, on_epoch=True)
+            self.log("tst_mf1", out_dic['tst_mf1'], on_step=False, on_epoch=True)
+            self.log("tst_rec", out_dic['tst_rec'], on_step=False, on_epoch=True)
+            self.log("tst_pre", out_dic['tst_pre'], on_step=False, on_epoch=True)
         self.outs.clear()
 
     def test_step(self, batch, batch_idx):
@@ -447,6 +506,7 @@ class Experiment:
         print(f"Model: {model_name}, Data: {data_name}, Loader: {cfg['loader_type']}, Preprocess: {cfg['preprocess']}")
         print(f"d_in: {self.cfg['d_in']}, n_classes: {self.cfg['n_classes']}")
         print(f"batch_size: {self.cfg['bs']}, max_epochs: {self.cfg['max_epochs']}, patience: {self.cfg['patience']}")
+        print(f"loss_mode: {self.cfg.get('loss_mode', 'baseline')} (RP-GAAP)")
         print()
         self.model = LitSAGE(**self.cfg)
         # 定义wandb_run
