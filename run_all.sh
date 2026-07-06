@@ -4,33 +4,44 @@ set -e
 RESULTS_DIR="results"
 mkdir -p "$RESULTS_DIR"
 
-MODES=("baseline" "focal" "rare" "both")
-SCRIPT="mycode/exp/101_retrain.py"
-CONFIG="yelp"
+DATASETS_101=("yelp" "tfinance" "elliptic" "tolokers")
+DATASETS_102=("tsocial" "dgraphfin")
+MODES=("baseline" "focal" "rare")
+SCRIPT_101="mycode/exp/101_retrain.py"
+SCRIPT_102="mycode/exp/102_retrain_reallinear_att.py"
 
-for mode in "${MODES[@]}"; do
-    echo "============================================"
-    echo "  Running: loss_mode=$mode"
-    echo "============================================"
+echo "============================================"
+echo "  RP-GAAP Full Sweep — 6 datasets x 3 modes"
+echo "============================================"
+echo ""
 
-    LOGFILE="$RESULTS_DIR/${mode}.log"
+for ds in "${DATASETS_101[@]}"; do
+    for mode in "${MODES[@]}"; do
+        LOGFILE="$RESULTS_DIR/${ds}_${mode}.log"
+        echo "[$ds] mode=$mode  ->  $LOGFILE"
+        python "$SCRIPT_101" -cn "$ds" "loss_mode=$mode" 2>&1 | tee "$LOGFILE"
+        echo ""
+    done
+done
 
-    python "$SCRIPT" -cn "$CONFIG" "loss_mode=$mode" 2>&1 | tee "$LOGFILE"
-
-    echo ""
-    echo "  Done: $mode  ->  $LOGFILE"
-    echo ""
+for ds in "${DATASETS_102[@]}"; do
+    for mode in "${MODES[@]}"; do
+        LOGFILE="$RESULTS_DIR/${ds}_${mode}.log"
+        echo "[$ds] mode=$mode  ->  $LOGFILE"
+        python "$SCRIPT_102" -cn "$ds" "loss_mode=$mode" 2>&1 | tee "$LOGFILE"
+        echo ""
+    done
 done
 
 echo "============================================"
-echo "  All runs complete. Logs in $RESULTS_DIR/"
+echo "  Done. Logs in $RESULTS_DIR/"
 echo "============================================"
 
-# Print summary of test metrics from each run
 echo ""
 echo "====== SUMMARY ======"
-for mode in "${MODES[@]}"; do
-    echo "--- $mode ---"
-    grep -E "f/(trn|val|tst)_(auc|aps|mf1|rec|pre|gme)" "$RESULTS_DIR/${mode}.log" | tail -18
+for f in "$RESULTS_DIR"/*.log; do
+    name=$(basename "$f" .log)
     echo ""
+    echo "--- $name ---"
+    grep "f/tst_" "$f" | head -10
 done
