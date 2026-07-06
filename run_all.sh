@@ -4,31 +4,20 @@ set -e
 RESULTS_DIR="results"
 mkdir -p "$RESULTS_DIR"
 
-DATASETS_101=("yelp" "tfinance" "elliptic" "tolokers")
-DATASETS_102=("tsocial" "dgraphfin")
+DATASETS=("yelp" "tfinance" "elliptic" "tolokers")
 MODES=("baseline" "focal" "rare")
-SCRIPT_101="mycode/exp/101_retrain.py"
-SCRIPT_102="mycode/exp/102_retrain_reallinear_att.py"
+SCRIPT="mycode/exp/101_retrain.py"
 
 echo "============================================"
-echo "  RP-GAAP Full Sweep — 6 datasets x 3 modes"
+echo "  RP-GAAP — 4 datasets x 3 modes"
 echo "============================================"
 echo ""
 
-for ds in "${DATASETS_101[@]}"; do
+for ds in "${DATASETS[@]}"; do
     for mode in "${MODES[@]}"; do
         LOGFILE="$RESULTS_DIR/${ds}_${mode}.log"
         echo "[$ds] mode=$mode  ->  $LOGFILE"
-        python "$SCRIPT_101" -cn "$ds" "loss_mode=$mode" 2>&1 | tee "$LOGFILE"
-        echo ""
-    done
-done
-
-for ds in "${DATASETS_102[@]}"; do
-    for mode in "${MODES[@]}"; do
-        LOGFILE="$RESULTS_DIR/${ds}_${mode}.log"
-        echo "[$ds] mode=$mode  ->  $LOGFILE"
-        python "$SCRIPT_102" -cn "$ds" "loss_mode=$mode" 2>&1 | tee "$LOGFILE"
+        python "$SCRIPT" -cn "$ds" "loss_mode=$mode" 2>&1 | tee "$LOGFILE"
         echo ""
     done
 done
