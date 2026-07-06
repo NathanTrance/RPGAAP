@@ -4,7 +4,7 @@ set -e
 RESULTS_DIR="results/sweep"
 mkdir -p "$RESULTS_DIR"
 
-DATASET="tfinance"
+DATASET="tolokers"
 SCRIPT="mycode/exp/101_retrain.py"
 
 echo "============================================"
