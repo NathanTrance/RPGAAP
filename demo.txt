@@ -255,42 +255,53 @@ class SAGEConv(nn.Module):
 
 
 class SAGE(nn.Module):
+    """GAAP: DyPLE → SAGE × N → MHA → Classifier.
+    Module names match production code so checkpoints load directly."""
     def __init__(self, d_in, n_classes, d_hidden=64, n_bins=32, d_feat_emb=32,
                  gnn_n_layers=3, use_mha=True, mha_n_heads=4, mha_alpha=0.2, n_nodes=None):
         super().__init__()
-        self.dyple = DyPLEC(d_in, n_bins)
-        self.nlinear = NLinear(d_in, n_bins, d_feat_emb)
-        self.bn0 = nn.BatchNorm1d(d_in)
-        self.linear_in = nn.Linear(d_in * d_feat_emb, d_hidden)
-        self.bn1 = nn.BatchNorm1d(d_hidden)
-        self.drop = nn.Dropout(0.1); self.act = nn.ReLU()
-        self.layers = nn.ModuleList([
+        # embedding0 submodules — match production DyPLEM naming
+        self.embedding0 = nn.Module()
+        self.embedding0.dy_ple_layer = DyPLEC(d_in, n_bins)
+        self.embedding0.nlinear = NLinear(d_in, n_bins, d_feat_emb)
+        self.embedding0.bn0 = nn.BatchNorm1d(d_in)
+        self.embedding0.linear = nn.Linear(d_in * d_feat_emb, d_hidden)
+        self.embedding0.bn1 = nn.BatchNorm1d(d_hidden)
+        self.embedding0.drop = nn.Dropout(0.1)
+        self.act = nn.ReLU()
+
+        # post_agg_layers — match production naming
+        self.post_agg_layers = nn.ModuleList([
             SAGEConv(d_hidden, d_hidden, 'max_pool', feat_drop=0.1,
                      norm=nn.BatchNorm1d(d_hidden), act=nn.ReLU())
             for _ in range(gnn_n_layers)
         ])
+
         self.use_mha = use_mha; self.alpha = mha_alpha
         if use_mha:
-            self.post_fc = nn.Sequential(nn.Dropout(0.1),
+            # post_fc_out — match production naming
+            self.post_fc_out = nn.Sequential(nn.Dropout(0.1),
                 nn.Linear(d_hidden, d_hidden * mha_n_heads), nn.ReLU(),
                 nn.BatchNorm1d(d_hidden * mha_n_heads))
             self.mha = nn.MultiheadAttention(d_hidden * mha_n_heads, mha_n_heads,
                                              dropout=0., batch_first=True)
             self.register_buffer('his_emb', torch.rand((n_nodes, d_hidden * mha_n_heads)))
         else:
-            self.post_fc = nn.Sequential(nn.Dropout(0.1), nn.Linear(d_hidden, d_hidden),
-                                         nn.ReLU(), nn.BatchNorm1d(d_hidden))
+            self.post_fc_out = nn.Sequential(nn.Dropout(0.1), nn.Linear(d_hidden, d_hidden),
+                                             nn.ReLU(), nn.BatchNorm1d(d_hidden))
             mha_n_heads = 1
         self.fc_out = nn.Linear(d_hidden * mha_n_heads, n_classes)
 
     def forward(self, blocks, feat):
-        h = self.dyple(feat); h = self.nlinear(h); h = F.relu(h)
-        h = self.bn0(h); h = self.drop(h); h = self.linear_in(h.flatten(1))
-        h = F.relu(h); h = self.bn1(h)
-        for layer, block in zip(self.layers, blocks):
+        # Manual DyPLEM forward (matches production logic)
+        e = self.embedding0
+        h = e.dy_ple_layer(feat); h = e.nlinear(h); h = F.relu(h)
+        h = e.bn0(h); h = e.drop(h); h = e.linear(h.flatten(1))
+        h = F.relu(h); h = e.bn1(h)
+        for layer, block in zip(self.post_agg_layers, blocks):
             last = h; h = layer(block, h)
             h = 0.7 * h + 0.3 * last[:block.num_dst_nodes()]
-        h = self.post_fc(h); gnn_out = h
+        h = self.post_fc_out(h); gnn_out = h
         if self.use_mha:
             v = k = self.his_emb; q = h[:blocks[-1].num_dst_nodes()]
             o, _ = self.mha(q, k, v); o = self.act(o)
@@ -303,8 +314,13 @@ class SAGE(nn.Module):
 
 # %% Cell 6: Setup models, samplers, rare weights, load checkpoints
 
-CKPT_BASE = "checkpoints/yelp_baseline.pt"
-CKPT_RARE = "checkpoints/yelp_rare.pt"
+# Point to your production Lightning checkpoints (from logs/ or wherever)
+CKPT_BASE = "checkpoints/yelp_baseline.ckpt"
+CKPT_RARE = "checkpoints/yelp_rare.ckpt"
+
+# If .ckpt not found, try .pt (demo self-saved format)
+if not os.path.exists(CKPT_BASE): CKPT_BASE = CKPT_BASE.replace('.ckpt', '.pt')
+if not os.path.exists(CKPT_RARE): CKPT_RARE = CKPT_RARE.replace('.ckpt', '.pt')
 
 def build_model():
     return SAGE(d_in=D, n_classes=2, n_nodes=N, d_hidden=64, n_bins=32,
