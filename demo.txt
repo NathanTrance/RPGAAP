@@ -55,14 +55,15 @@ print(f"Device: {device}")
 DATASET = "yelp"
 graph = dgl.load_graphs(f"datasets/{DATASET}")[0][0]
 
-graph.ndata['train_mask'] = graph.ndata['train_masks'][:, 0].bool()
-graph.ndata['val_mask']   = graph.ndata['val_masks'][:, 0].bool()
-graph.ndata['test_mask']  = graph.ndata['test_masks'][:, 0].bool()
-graph.ndata['feature']    = graph.ndata['feature'].float()
-graph.ndata['label']       = graph.ndata['label'].long()
+graph.ndata['train_mask'] = graph.ndata['train_masks'][:, 0].bool().contiguous()
+graph.ndata['val_mask']   = graph.ndata['val_masks'][:, 0].bool().contiguous()
+graph.ndata['test_mask']  = graph.ndata['test_masks'][:, 0].bool().contiguous()
+graph.ndata['feature']    = graph.ndata['feature'].float().contiguous()
+graph.ndata['label']       = graph.ndata['label'].long().contiguous()
+graph = graph.astype(torch.int64)
 
 feat = graph.ndata['feature']
-feat = (feat - feat.min(0).values) / (feat.max(0).values - feat.min(0).values + 1e-8)
+feat = (feat - feat.min(0).values) / (feat.max(0).values - feat.min(0).values)
 graph.ndata['feature'] = feat
 
 N = graph.num_nodes()
