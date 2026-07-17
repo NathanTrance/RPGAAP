@@ -299,9 +299,9 @@ class SAGE(nn.Module):
 
 
 # %% [markdown]
-# ## 4. Load Pretrained Checkpoints & Quick Training Demo
+# ## 4. Load Pretrained Checkpoints
 
-# %% Cell 6: Load checkpoints or do fast 5-epoch demo
+# %% Cell 6: Setup models, samplers, rare weights, load checkpoints
 
 CKPT_BASE = "checkpoints/yelp_baseline.pt"
 CKPT_RARE = "checkpoints/yelp_rare.pt"
@@ -334,13 +334,12 @@ rare_weights = make_rare_pattern_weights(
 
 focal_loss_fn = FocalLoss(gamma=2.0, alpha=[1.0, 3.0], reduction='mean')
 
-# ------------------ Load checkpoint if exists ------------------
+# Load checkpoint if exists
 loaded = False
 if os.path.exists(CKPT_BASE) and os.path.exists(CKPT_RARE):
     print("Loading pretrained checkpoints...")
     sd_base = torch.load(CKPT_BASE, map_location=device, weights_only=False)
     sd_rare = torch.load(CKPT_RARE, map_location=device, weights_only=False)
-    # Strip 'model.' prefix if from Lightning checkpoint
     if any(k.startswith('model.') for k in sd_base.get('state_dict', {}).keys()):
         sd_base = {k[6:]: v for k, v in sd_base['state_dict'].items() if k.startswith('model.')}
         sd_rare = {k[6:]: v for k, v in sd_rare['state_dict'].items() if k.startswith('model.')}
@@ -353,9 +352,84 @@ if os.path.exists(CKPT_BASE) and os.path.exists(CKPT_RARE):
     print("Checkpoints loaded.")
 else:
     print(f"No checkpoints found at {CKPT_BASE} / {CKPT_RARE}")
-    print("Running 5-epoch quick demo instead...")
 
-# ------------------ Quick 5-epoch demo (for show) ------------------
+# Helper: full graph inference
+@torch.no_grad()
+def infer_all(model):
+    model.eval()
+    all_y, all_prob, all_nid = [], [], []
+    for _, _, blocks in val_loader:
+        x = blocks[0].srcdata['feature']; y = blocks[-1].dstdata['label']
+        prob = model(blocks, x)[0].softmax(-1)[:, 1]
+        all_y.append(y); all_prob.append(prob); all_nid.append(blocks[-1].dstdata[dgl.NID])
+    y = torch.cat(all_y)[torch.argsort(torch.cat(all_nid))]
+    prob = torch.cat(all_prob)[torch.argsort(torch.cat(all_nid))]
+    return y.cpu().numpy(), prob.cpu().numpy()
+
+# %% [markdown]
+# ## 5. Test Set Evaluation (from Checkpoints)
+
+# %% Cell 7: Evaluate loaded models on test set
+
+from sklearn.metrics._ranking import _binary_clf_curve
+
+def compute_all_metrics(y, prob, tst_idx, val_idx):
+    """Compute all metrics using val-optimal threshold."""
+    fps, tps, thresholds = _binary_clf_curve(y[val_idx], prob[val_idx])
+    n_pos, n_neg_val = y[val_idx].sum(), len(y[val_idx]) - y[val_idx].sum()
+    f11 = 2 * tps / (2 * tps + (n_pos - tps) + fps + 1e-12)
+    best_thr = thresholds[np.argmax(f11)]
+    preds = (prob > best_thr).astype(int)
+
+    # tst_top: Recall@K where K = # fraud nodes in test
+    top_n = int(y[tst_idx].sum())
+    top_indices = np.argsort(prob[tst_idx])[-top_n:]
+    top_pred = np.zeros_like(prob[tst_idx]); top_pred[top_indices] = 1
+
+    return {
+        'AUC': roc_auc_score(y[tst_idx], prob[tst_idx]),
+        'AP': average_precision_score(y[tst_idx], prob[tst_idx]),
+        'Macro-F1': f1_score(y[tst_idx], preds[tst_idx], average='macro'),
+        'Fraud Recall': recall_score(y[tst_idx], preds[tst_idx]),
+        'Fraud Precision': precision_score(y[tst_idx], preds[tst_idx]),
+        'tst_top (Recall@K)': recall_score(y[tst_idx], top_pred),
+        'Accuracy': np.mean(preds[tst_idx] == y[tst_idx]),
+        'Threshold (val-opt)': best_thr,
+    }
+
+y_all, prob_base = infer_all(model_base)
+_, prob_rare = infer_all(model_rare)
+
+res_base = compute_all_metrics(y_all, prob_base, test_idx, val_idx)
+res_rare = compute_all_metrics(y_all, prob_rare, test_idx, val_idx)
+
+df = pd.DataFrame({
+    'Metric': list(res_base.keys()),
+    'GAAP (Baseline)': [res_base[k] for k in res_base],
+    'RP-GAAP (Rare)': [res_rare[k] for k in res_rare],
+    'Δ': [res_rare[k] - res_base[k] for k in res_base],
+})
+
+# Format for display
+df_display = df.copy()
+for col in ['GAAP (Baseline)', 'RP-GAAP (Rare)']:
+    df_display[col] = df_display[col].apply(lambda x: f"{x:.4f}" if isinstance(x, float) else x)
+df_display['Δ'] = [f"{v:+.4f}" if isinstance(v, float) else '—' for v in df['Δ']]
+
+print("\n" + "=" * 70)
+print("  RP-GAAP vs GAAP — YelpChi Test Results")
+print("=" * 70)
+print(df_display.to_string(index=False))
+print("=" * 70)
+
+wins = sum(1 for v in df['Δ'] if isinstance(v, float) and v > 0)
+print(f"\nRP-GAAP improves on {wins}/{len(df)} metrics over baseline.")
+
+# %% [markdown]
+# ## 6. Quick Training Demo (for show — skip if checkpoints loaded)
+
+# %% Cell 8: Run 5-epoch quick demo to observe loss decreasing
+
 MAX_EPOCHS = 5
 history = {'base_loss': [], 'rare_loss': [], 'base_auc': [], 'rare_auc': []}
 
@@ -373,44 +447,50 @@ def quick_eval(model):
         y, prob = y.cpu().numpy(), prob.cpu().numpy()
         return roc_auc_score(y[val_idx], prob[val_idx]), average_precision_score(y[val_idx], prob[val_idx])
 
-opt_base = torch.optim.Adam(model_base.parameters(), lr=0.001)
-opt_rare = torch.optim.Adam(model_rare.parameters(), lr=0.001)
+if not loaded:
+    print("No checkpoints — training fresh for demo...")
+else:
+    print("Checkpoints loaded — this cell trains a FRESH model (for demonstration)")
+
+# Keep the checkpoint models, train fresh copies for demo
+model_base_fresh = build_model(); model_rare_fresh = build_model()
+opt_base = torch.optim.Adam(model_base_fresh.parameters(), lr=0.001)
+opt_rare = torch.optim.Adam(model_rare_fresh.parameters(), lr=0.001)
 
 print(f"{'Epoch':>5} | {'Base Loss':>10} | {'Base AUC':>9} | {'Rare Loss':>10} | {'Rare AUC':>9}")
 print("-" * 60)
 for epoch in range(1, MAX_EPOCHS + 1):
-    # Baseline
-    model_base.train(); loss_b = 0
+    model_base_fresh.train(); loss_b = 0
     for _, _, blocks in trn_loader:
         x = blocks[0].srcdata['feature']; y = blocks[-1].dstdata['label']
-        logits, _ = model_base(blocks, x)
+        logits, _ = model_base_fresh(blocks, x)
         l = F.cross_entropy(logits, y); opt_base.zero_grad(); l.backward(); opt_base.step()
         loss_b += l.item()
     loss_b /= len(trn_loader)
-    # Rare
-    model_rare.train(); loss_r = 0
+
+    model_rare_fresh.train(); loss_r = 0
     for _, _, blocks in trn_loader:
         x = blocks[0].srcdata['feature']; y = blocks[-1].dstdata['label']
         nid = blocks[-1].dstdata[dgl.NID]; sw = rare_weights[nid].to(x.device)
-        logits, _ = model_rare(blocks, x)
+        logits, _ = model_rare_fresh(blocks, x)
         l_each = F.cross_entropy(logits, y, reduction='none')
         l = (l_each * sw).mean(); opt_rare.zero_grad(); l.backward(); opt_rare.step()
         loss_r += l.item()
     loss_r /= len(trn_loader)
-    auc_b, aps_b = quick_eval(model_base)
-    auc_r, aps_r = quick_eval(model_rare)
+
+    auc_b, aps_b = quick_eval(model_base_fresh)
+    auc_r, aps_r = quick_eval(model_rare_fresh)
     history['base_loss'].append(loss_b); history['rare_loss'].append(loss_r)
     history['base_auc'].append(auc_b); history['rare_auc'].append(auc_r)
     print(f"{epoch:5d} | {loss_b:10.4f} | {auc_b:9.4f} | {loss_r:10.4f} | {auc_r:9.4f}")
 
 if not loaded:
-    # Save for next time
     os.makedirs("checkpoints", exist_ok=True)
     torch.save(model_base.state_dict(), CKPT_BASE)
     torch.save(model_rare.state_dict(), CKPT_RARE)
     print(f"Saved to {CKPT_BASE}, {CKPT_RARE}")
 
-# %% Cell 7: Training Curves
+# %% Cell 9: Training Curves
 fig, axes = plt.subplots(1, 2, figsize=(13, 4))
 axes[0].plot(history['base_loss'], 'o-', label='Baseline (GAAP)', lw=2)
 axes[0].plot(history['rare_loss'], 's-', label='Rare-Weighted (RP-GAAP)', lw=2)
@@ -421,24 +501,9 @@ axes[1].set_title("Validation AUC"); axes[1].set_xlabel("Epoch"); axes[1].legend
 plt.tight_layout(); plt.show()
 
 # %% [markdown]
-# ## 5. Sample Nodes — What Do Rare Patterns Look Like?
+# ## 7. Sample Nodes — What Do Rare Patterns Look Like?
 
-# %% Cell 8: Full graph inference + pattern computation
-
-@torch.no_grad()
-def infer_all(model):
-    model.eval()
-    all_y, all_prob, all_nid = [], [], []
-    for _, _, blocks in val_loader:
-        x = blocks[0].srcdata['feature']; y = blocks[-1].dstdata['label']
-        prob = model(blocks, x)[0].softmax(-1)[:, 1]
-        all_y.append(y); all_prob.append(prob); all_nid.append(blocks[-1].dstdata[dgl.NID])
-    y = torch.cat(all_y)[torch.argsort(torch.cat(all_nid))]
-    prob = torch.cat(all_prob)[torch.argsort(torch.cat(all_nid))]
-    return y.cpu().numpy(), prob.cpu().numpy()
-
-y_all, prob_base = infer_all(model_base)
-_, prob_rare = infer_all(model_rare)
+# %% Cell 10: Full graph inference + pattern computation
 
 # Compute per-node pattern IDs, bin assignments, and weights
 fnp_all = feat.numpy(); lbl_all = lnp
@@ -571,51 +636,9 @@ for i, (nid, role) in enumerate(zip(sample_nids, roles)):
 plt.tight_layout(); plt.show()
 
 # %% [markdown]
-# ## 6. Full Evaluation Results
+# ## 8. Rare Pattern → Fraud Map
 
-# %% Cell 9: Results Table
-
-from sklearn.metrics._ranking import _binary_clf_curve
-
-def compute_metrics(y, prob, idx):
-    fps, tps, thresholds = _binary_clf_curve(y[val_idx], prob[val_idx])
-    n_pos, n_neg = y[val_idx].sum(), len(y[val_idx]) - y[val_idx].sum()
-    f11 = 2 * tps / (2 * tps + (n_pos - tps) + fps)
-    best_thr = thresholds[np.argmax(f11)]
-    preds = (prob > best_thr).astype(int)
-    top_n = int(y[idx].sum())
-    top_indices = np.argsort(prob[idx])[-top_n:]
-    top_pred = np.zeros_like(prob[idx]); top_pred[top_indices] = 1
-    return {
-        'AUC': roc_auc_score(y[idx], prob[idx]),
-        'AP': average_precision_score(y[idx], prob[idx]),
-        'Macro-F1': f1_score(y[idx], preds[idx], average='macro'),
-        'Fraud Recall': recall_score(y[idx], preds[idx]),
-        'Fraud Precision': precision_score(y[idx], preds[idx]),
-        'tst_top (Recall@K)': recall_score(y[idx], top_pred),
-        'Accuracy': np.mean(preds[idx] == y[idx]),
-    }
-
-res_base = compute_metrics(y_all, prob_base, test_idx)
-res_rare = compute_metrics(y_all, prob_rare, test_idx)
-
-df = pd.DataFrame({
-    'Metric': list(res_base.keys()),
-    'GAAP (Baseline)': [f"{v:.4f}" for v in res_base.values()],
-    'RP-GAAP (Rare)': [f"{v:.4f}" for v in res_rare.values()],
-    'Δ': [f"{res_rare[k]-res_base[k]:+.4f}" for k in res_base],
-})
-
-print("\n" + "=" * 70)
-print("  RP-GAAP vs GAAP — YelpChi Test Results")
-print("=" * 70)
-print(df.to_string(index=False))
-print("=" * 70)
-
-# %% [markdown]
-# ## 7. Rare Pattern → Fraud Map
-
-# %% Cell 10: Scatter: Pattern Frequency vs Fraud Rate
+# %% Cell 11: Scatter — Pattern Frequency vs Fraud Rate
 
 up_full, uinv_full, cnts_full = np.unique(pat_all[train_mask], return_inverse=True, return_counts=True)
 fr_by_pat = np.array([lnp[train_mask][uinv_full == i].mean() for i in range(len(up_full))])
