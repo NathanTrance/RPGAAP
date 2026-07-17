@@ -371,9 +371,8 @@ plt.tight_layout(); plt.show()
 # %% [markdown]
 # ## 5. Sample Nodes — What Do Rare Patterns Look Like?
 
-# %% Cell 8: Show concrete fraud/normal nodes with their patterns
+# %% Cell 8: Full graph inference + pattern computation
 
-# Full graph evaluation
 @torch.no_grad()
 def infer_all(model):
     model.eval()
@@ -389,85 +388,133 @@ def infer_all(model):
 y_all, prob_base = infer_all(model_base)
 _, prob_rare = infer_all(model_rare)
 
-# Compute per-node pattern IDs across full graph
+# Compute per-node pattern IDs, bin assignments, and weights
 fnp_all = feat.numpy(); lbl_all = lnp
 K, BINS = 5, 5
 var = np.var(fnp_all[train_mask], axis=0)
 topk_idx = np.argsort(var)[-K:]
 pat_all = np.zeros(N, dtype=np.int64)
+bin_assignments = np.zeros((N, K), dtype=np.int32)
 mult = 1
-for col in topk_idx:
+for j, col in enumerate(topk_idx):
     q = np.quantile(fnp_all[train_mask][:, col], np.linspace(0, 1, BINS + 1))
     q[0], q[-1] = -np.inf, np.inf
-    pat_all += np.digitize(fnp_all[:, col], q[1:-1], right=False) * mult
+    digitized = np.digitize(fnp_all[:, col], q[1:-1], right=False)
+    bin_assignments[:, j] = digitized
+    pat_all += digitized * mult
     mult *= BINS
 
 up, uinv, ucnts = np.unique(pat_all, return_inverse=True, return_counts=True)
-pat_freq = ucnts[uinv]  # frequency per node
-pat_rank = np.argsort(np.argsort(ucnts))[uinv] + 1  # 1 = rarest
+pat_freq = ucnts[uinv]
+pat_rank = np.argsort(np.argsort(ucnts))[uinv] + 1
 pat_wt = 1.0 + 2.0 * (ucnts.max() - ucnts[uinv]) / max(1, ucnts.max() - ucnts.min())
 
-# Pick interesting test nodes: fraud caught by rare but missed by baseline
+# Graph degree & neighbor characteristics
+in_degree = graph.in_degrees().numpy()
+out_degree = graph.out_degrees().numpy()
+neigh_labels = lbl_all  # for fast lookup, we precompute neighbor fraud rates
+graph_cpu = graph.cpu()
+neigh_fraud_rate = np.zeros(N)
+for nid in range(N):
+    preds = graph_cpu.predecessors(nid).numpy()
+    if len(preds) > 0:
+        neigh_fraud_rate[nid] = lbl_all[preds].mean()
+    succs = graph_cpu.successors(nid).numpy()
+    if len(succs) > 0:
+        neigh_fraud_rate[nid] = max(neigh_fraud_rate[nid], lbl_all[succs].mean())
+
+# Compute bin boundaries for display
+bin_edges_all = {}
+for j, col in enumerate(topk_idx):
+    q = np.quantile(fnp_all[train_mask][:, col], np.linspace(0, 1, BINS + 1))
+    bin_edges_all[col] = q
+
+# %% Cell 8b: Pick interesting samples & display them
+
 test_nodes = test_idx.numpy()
 fraud_test = test_nodes[lbl_all[test_nodes] == 1]
 thr = 0.5
-
-# Baseline misses these fraud nodes
 missed_base = fraud_test[prob_base[fraud_test] <= thr]
 caught_by_rare = missed_base[prob_rare[missed_base] > thr]
 
-print(f"Fraud test nodes: {len(fraud_test)}")
-print(f"Missed by baseline (thr=0.5): {len(missed_base)}")
-print(f"Of those, caught by rare: {len(caught_by_rare)}")
-print(f"Recall uplift: +{len(caught_by_rare)/len(fraud_test)*100:.1f}%\n")
+print(f"=== Case Study: Fraud Missed by GAAP, Caught by RP-GAAP ===\n")
+print(f"Total fraud test nodes: {len(fraud_test)}")
+print(f"Missed by baseline  (prob <= 0.5): {len(missed_base)} ({len(missed_base)/len(fraud_test)*100:.1f}%)")
+print(f"Of those, caught by rare: {len(caught_by_rare)} (+{len(caught_by_rare)/len(fraud_test)*100:.1f}% recall uplift)")
 
-# Build sample table
-sample_nodes = []
-# 5 fraud: missed by baseline, caught by rare
+# Select 3 fraud + 2 rare normal
+sample_nids = []
+roles = []
 if len(caught_by_rare) >= 3:
-    picks_fraud = np.random.choice(caught_by_rare, min(3, len(caught_by_rare)), replace=False)
-    for nid in picks_fraud:
-        sample_nodes.append({'Node': nid, 'Label': 'FRAUD',
-                             'Pattern ID': pat_all[nid], 'Pattern Freq': pat_freq[nid],
-                             'Weight': f"{pat_wt[nid]:.2f}",
-                             'Baseline Prob': f"{prob_base[nid]:.4f}",
-                             'Rare Prob': f"{prob_rare[nid]:.4f}",
-                             'Caught?': '✓ Rare only'})
-# 2 normal nodes with high weight (rare normal patterns)
+    picks = np.random.choice(caught_by_rare, min(3, len(caught_by_rare)), replace=False)
+    for nid in picks:
+        sample_nids.append(nid); roles.append('FRAUD (caught by RP-GAAP)')
+# Normal nodes with rarest patterns
 normal_test = test_nodes[lbl_all[test_nodes] == 0]
-rare_normals = normal_test[np.argsort(pat_rank[normal_test])[:5]]
-if len(rare_normals) >= 2:
-    picks_normal = np.random.choice(rare_normals, min(2, len(rare_normals)), replace=False)
-    for nid in picks_normal:
-        sample_nodes.append({'Node': nid, 'Label': 'NORMAL',
-                             'Pattern ID': pat_all[nid], 'Pattern Freq': pat_freq[nid],
-                             'Weight': f"{pat_wt[nid]:.2f}",
-                             'Baseline Prob': f"{prob_base[nid]:.4f}",
-                             'Rare Prob': f"{prob_rare[nid]:.4f}",
-                             'Caught?': 'OK'})
+rare_norms = normal_test[np.argsort(pat_rank[normal_test])[:10]]
+if len(rare_norms) >= 2:
+    picks = np.random.choice(rare_norms, min(2, len(rare_norms)), replace=False)
+    for nid in picks:
+        sample_nids.append(nid); roles.append('NORMAL (rare pattern)')
 
-df = pd.DataFrame(sample_nodes)
-print("Sample nodes (test set):\n")
-print(df.to_string(index=False))
+sample_nids = np.array(sample_nids)
 
-# Show feature signatures for sample nodes
-fig, axes = plt.subplots(len(sample_nodes), 1, figsize=(12, 2.5 * len(sample_nodes)))
-if len(sample_nodes) == 1: axes = [axes]
-for i, (_, row) in enumerate(df.iterrows()):
-    nid = int(row['Node']); lbl = row['Label']
+# ---- Summary Table ----
+print(f"\n{'─'*90}")
+print(f"{'Node':<7} {'True':<6} {'Role':<28} {'#Neigh':<8} {'Nbr%Fraud':<10} {'Weight':<7} {'P(base)':<8} {'P(rare)':<8} {'Δ':<6}")
+print(f"{'─'*90}")
+for nid, role in zip(sample_nids, roles):
+    nbrs = in_degree[nid] + out_degree[nid]
+    print(f"{nid:<7} {'FRAUD' if lbl_all[nid]==1 else 'NORM':<6} {role:<28} "
+          f"{nbrs:<8} {neigh_fraud_rate[nid]:.3f}     "
+          f"{pat_wt[nid]:.3f}   {prob_base[nid]:.4f}   {prob_rare[nid]:.4f}   "
+          f"{prob_rare[nid]-prob_base[nid]:+.4f}")
+print(f"{'─'*90}")
+
+# ---- Feature Breakdown per Sample ----
+print(f"\n=== Feature-by-Feature Breakdown ===\n")
+for nid, role in zip(sample_nids, roles):
+    print(f"━━━ Node {nid} | {role} | Pattern #{pat_all[nid]} (rank {pat_rank[nid]}/{len(up)}) | "
+          f"Freq={pat_freq[nid]}, Weight={pat_wt[nid]:.2f} ━━━")
+    print(f"{'Feat':<7} {'Value':>10} {'Bin':>5} {'Population%ile':>15} {'Normal mean':>13} {'Fraud mean':>13}")
+    print(f"{'─'*68}")
+    for j, col in enumerate(topk_idx):
+        val = fnp_all[nid, col]
+        b = bin_assignments[nid, j]
+        edge = bin_edges_all[col]
+        percentile = np.mean(fnp_all[:, col] <= val) * 100
+        norm_m = fnp_all[lbl_all == 0, col].mean()
+        frd_m = fnp_all[lbl_all == 1, col].mean()
+        indicator = ' ◀── DEVIATES' if abs(val - norm_m) > np.std(fnp_all[:, col]) else ''
+        print(f"F{col:<6} {val:10.4f} {b:>5} {percentile:13.1f}% {norm_m:13.4f} {frd_m:13.4f}{indicator}")
+    print(f"{'─'*68}")
+    nbrs = in_degree[nid] + out_degree[nid]
+    print(f"Degree: {nbrs} (in={in_degree[nid]}, out={out_degree[nid]}) | "
+          f"Neighbors' fraud rate: {neigh_fraud_rate[nid]:.3f}")
+    print()
+
+# ---- Visual: Feature Signatures ----
+fig, axes = plt.subplots(len(sample_nids), 1, figsize=(13, 3 * len(sample_nids)))
+if len(sample_nids) == 1: axes = [axes]
+for i, (nid, role) in enumerate(zip(sample_nids, roles)):
     feat_vals = fnp_all[nid, topk_idx]
     mid = np.median(fnp_all[:, topk_idx], axis=0)
     q25 = np.percentile(fnp_all[:, topk_idx], 25, axis=0)
     q75 = np.percentile(fnp_all[:, topk_idx], 75, axis=0)
     x = np.arange(K)
-    axes[i].fill_between(x, q25, q75, alpha=0.2, label='IQR')
-    axes[i].plot(x, mid, 'k--', alpha=0.3, label='Median')
-    color = 'red' if lbl == 'FRAUD' else 'green'
-    axes[i].plot(x, feat_vals, f'{color}o-', lw=2, ms=8, label=f'Node {nid} ({lbl})')
-    axes[i].set_xticks(x); axes[i].set_xticklabels([f"Feat {f}" for f in topk_idx])
-    axes[i].set_title(f"Node {nid} ({lbl}) | Pattern {row['Pattern ID']} | "
-                      f"P_base={row['Baseline Prob']} P_rare={row['Rare Prob']}")
-    axes[i].legend(fontsize=7)
+    axes[i].fill_between(x, q25, q75, alpha=0.15, label='Population IQR')
+    axes[i].plot(x, mid, 'k--', alpha=0.25, label='Population Median')
+    color = '#e74c3c' if lbl_all[nid] == 1 else '#2ecc71'
+    marker = 'D' if lbl_all[nid] == 1 else 'o'
+    axes[i].plot(x, feat_vals, color=color, marker=marker, lw=2.5, ms=10,
+                 label=f'Node {nid}')
+    axes[i].set_xticks(x); axes[i].set_xticklabels([f"F{f}" for f in topk_idx])
+    axes[i].set_ylabel("Feature Value")
+    title = (f"Node {nid} | {'🔴 FRAUD' if lbl_all[nid]==1 else '🟢 NORMAL'} | "
+             f"Pattern #{pat_all[nid]} (rank #{pat_rank[nid]}/{len(up)}) | "
+             f"GAAP={prob_base[nid]:.3f} → RP-GAAP={prob_rare[nid]:.3f}")
+    axes[i].set_title(title, fontsize=11)
+    axes[i].legend(fontsize=7, loc='upper left')
 plt.tight_layout(); plt.show()
 
 # %% [markdown]
