@@ -94,6 +94,57 @@ plt.suptitle("Top-6 Feature Distributions: Normal vs Fraud", fontsize=14)
 plt.tight_layout(); plt.show()
 
 # %% [markdown]
+# ## 1.5. What Do the Features Mean?
+#
+# YelpChi's 32 handcrafted features capture reviewer behavior, review content,
+# and rating patterns. Each node = one Yelp review. Here's a quick reference:
+
+# %% Cell 3b: Feature Reference — What Each Feature Represents
+
+FEATURE_NAMES = [
+    "F0:  Review length (chars)",      "F1:  % positive words",
+    "F2:  % negative words",           "F3:  Cosine sim to other reviews by same user",
+    "F4:  Rating deviation from product avg", "F5:  Max rating deviation",
+    "F6:  Review count of user",       "F7:  User account age (days)",
+    "F8:  Ratio of 5-star reviews",    "F9:  Ratio of 1-star reviews",
+    "F10: Avg rating given by user",   "F11: Std of ratings given by user",
+    "F12: Days since first review",    "F13: Days since last review",
+    "F14: Burstiness (reviews in 24h)", "F15: Whether also reviewed same product before",
+    "F16: Product avg rating",         "F17: Product review count",
+    "F18: % of product's 5-star reviews", "F19: % of product's 1-star reviews",
+    "F20: Product rating std",         "F21: Days since product first review",
+    "F22: % positive feedback on user", "F23: % negative feedback on user",
+    "F24: Friend count of user",       "F25: Fan count of user",
+    "F26: Complement count received",  "F27: Elite years",
+    "F28: Avg review length of user",  "F29: Review length / avg user length",
+    "F30: Rating / user avg rating",   "F31: Time since product listed",
+]
+
+# Show top-5 most variable features (the ones rare-pattern weighting uses)
+print(f"{'Feature':<12} {'Description':<52} {'Norm μ':>8} {'Fraud μ':>8} {'Δ':>8} {'σ':>8}")
+print("─" * 98)
+for idx in top_feats:
+    nmu = fnp[lnp == 0, idx].mean()
+    fmu = fnp[lnp == 1, idx].mean()
+    sig = fnp[:, idx].std()
+    print(f"F{idx:<11} {FEATURE_NAMES[idx]:<52} {nmu:8.3f} {fmu:8.3f} {fmu-nmu:8.3f} {sig:8.3f}")
+print("─" * 98)
+print(f"\nThese {len(top_feats)} features drive the rare-pattern computation.")
+print("Each gets split into 5 quantile bins, and the bin vector becomes the 'pattern ID'.")
+
+# Quick reference: all 32 features in a compact table
+feature_df = pd.DataFrame({
+    'Idx': range(32),
+    'Name': FEATURE_NAMES,
+    'Variance': var,
+    'Normal Mean': [f"{fnp[lnp==0, i].mean():.3f}" for i in range(32)],
+    'Fraud Mean': [f"{fnp[lnp==1, i].mean():.3f}" for i in range(32)],
+})
+feature_df = feature_df.sort_values('Variance', ascending=False).reset_index(drop=True)
+print(f"\nFull feature catalog (sorted by variance):")
+print(feature_df.head(16).to_string(index=False))
+
+# %% [markdown]
 # ## 2. Rare-Pattern Computation (Step-by-Step)
 
 # %% Cell 4: Rare Pattern Weighting — Visual Walkthrough
@@ -476,17 +527,17 @@ print(f"\n=== Feature-by-Feature Breakdown ===\n")
 for nid, role in zip(sample_nids, roles):
     print(f"━━━ Node {nid} | {role} | Pattern #{pat_all[nid]} (rank {pat_rank[nid]}/{len(up)}) | "
           f"Freq={pat_freq[nid]}, Weight={pat_wt[nid]:.2f} ━━━")
-    print(f"{'Feat':<7} {'Value':>10} {'Bin':>5} {'Population%ile':>15} {'Normal mean':>13} {'Fraud mean':>13}")
-    print(f"{'─'*68}")
+    print(f"{'Feat':<10} {'Value':>10} {'Bin':>5} {'%ile':>7} {'Normal μ':>10} {'Fraud μ':>10}")
+    print(f"{'─'*58}")
     for j, col in enumerate(topk_idx):
         val = fnp_all[nid, col]
         b = bin_assignments[nid, j]
-        edge = bin_edges_all[col]
         percentile = np.mean(fnp_all[:, col] <= val) * 100
         norm_m = fnp_all[lbl_all == 0, col].mean()
         frd_m = fnp_all[lbl_all == 1, col].mean()
-        indicator = ' ◀── DEVIATES' if abs(val - norm_m) > np.std(fnp_all[:, col]) else ''
-        print(f"F{col:<6} {val:10.4f} {b:>5} {percentile:13.1f}% {norm_m:13.4f} {frd_m:13.4f}{indicator}")
+        indicator = ' ◀── ANOMALOUS' if abs(val - norm_m) > np.std(fnp_all[:, col]) else ''
+        name = FEATURE_NAMES[col]
+        print(f"{name:<10} {val:10.4f} {b:>5} {percentile:6.1f}% {norm_m:10.4f} {frd_m:10.4f}{indicator}")
     print(f"{'─'*68}")
     nbrs = in_degree[nid] + out_degree[nid]
     print(f"Degree: {nbrs} (in={in_degree[nid]}, out={out_degree[nid]}) | "
@@ -508,7 +559,8 @@ for i, (nid, role) in enumerate(zip(sample_nids, roles)):
     marker = 'D' if lbl_all[nid] == 1 else 'o'
     axes[i].plot(x, feat_vals, color=color, marker=marker, lw=2.5, ms=10,
                  label=f'Node {nid}')
-    axes[i].set_xticks(x); axes[i].set_xticklabels([f"F{f}" for f in topk_idx])
+    axes[i].set_xticks(x); axes[i].set_xticklabels(
+        [f"{FEATURE_NAMES[f]}" for f in topk_idx], rotation=25, ha='right', fontsize=7)
     axes[i].set_ylabel("Feature Value")
     title = (f"Node {nid} | {'🔴 FRAUD' if lbl_all[nid]==1 else '🟢 NORMAL'} | "
              f"Pattern #{pat_all[nid]} (rank #{pat_rank[nid]}/{len(up)}) | "
